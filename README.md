@@ -22,6 +22,14 @@
 <!-- تصاویر زیر را با عکس‌های خودتان جایگزین کنید (نام فایل‌ها را نگه دارید یا مسیرها را عوض کنید). -->
 
 <p align="center">
+  <img src="docs/img-1.png" alt="Light theme" width="96%">
+</p>
+
+<p align="center">
+  <img src="docs/img-2.png" alt="Light theme" width="96%">
+</p>
+
+<!-- <p align="center">
   <img src="docs/img-1.png" alt="Light theme" width="48%">
   <img src="docs/img-2.png" alt="Dark theme" width="48%">
 </p>
@@ -33,7 +41,7 @@
   <img src="docs/img-5.png" alt="Light theme" width="48%">
   <img src="docs/img-6.png" alt="Dark theme" width="48%">
 </p>
-
+ -->
 
 ---
 

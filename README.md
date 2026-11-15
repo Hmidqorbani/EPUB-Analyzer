@@ -5,6 +5,7 @@
 # EPUB Analyzer
 
 **Count the words, letters, sentences and chapters of any EPUB book.**
+<br>
 **کلمه‌ها، حرف‌ها، جمله‌ها و فصل‌های هر کتاب EPUB را بشمارید.**
 
 ![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)
@@ -18,30 +19,25 @@
 
 ## Screenshots · تصاویر
 
-<!-- Replace these images with your own (keep the same file names, or edit the paths). -->
-<!-- تصاویر زیر را با عکس‌های خودتان جایگزین کنید (نام فایل‌ها را نگه دارید یا مسیرها را عوض کنید). -->
 
-<p align="center">
-  <img src="docs/img-1.png" alt="Light theme" width="96%">
-</p>
-
-<p align="center">
-  <img src="docs/img-2.png" alt="Light theme" width="96%">
-</p>
-
-<!-- <p align="center">
+ <p align="center">
   <img src="docs/img-1.png" alt="Light theme" width="48%">
   <img src="docs/img-2.png" alt="Dark theme" width="48%">
 </p>
+
 <p align="center">
-  <img src="docs/img-5.png" alt="Light theme" width="48%">
-  <img src="docs/img-4.png" alt="Dark theme" width="48%">
+  <img src="docs/img-3.png" alt="Light theme" width="96%">
 </p>
 <p align="center">
-  <img src="docs/img-5.png" alt="Light theme" width="48%">
-  <img src="docs/img-6.png" alt="Dark theme" width="48%">
+  <img src="docs/img-4.png" alt="Light theme" width="96%">
 </p>
- -->
+<p align="center">
+  <img src="docs/img-5.png" alt="Light theme" width="96%">
+</p>
+<p align="center">
+  <img src="docs/img-6.png" alt="Light theme" width="96%">
+</p>
+
 
 ---
 

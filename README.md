@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="docs/logo.png" alt="EPUB Analyzer logo" width="128">
+<img src="docs/icon.ico" alt="EPUB Analyzer logo" width="128">
 
 # EPUB Analyzer
 
@@ -22,134 +22,18 @@
 <!-- تصاویر زیر را با عکس‌های خودتان جایگزین کنید (نام فایل‌ها را نگه دارید یا مسیرها را عوض کنید). -->
 
 <p align="center">
-  <img src="docs/screenshots/screenshot-light.png" alt="Light theme" width="48%">
-  <img src="docs/screenshots/screenshot-dark.png" alt="Dark theme" width="48%">
+  <img src="docs/img-1.png" alt="Light theme" width="48%">
+  <img src="docs/img-2.png" alt="Dark theme" width="48%">
+</p>
+<p align="center">
+  <img src="docs/img-5.png" alt="Light theme" width="48%">
+  <img src="docs/img-4.png" alt="Dark theme" width="48%">
+</p>
+<p align="center">
+  <img src="docs/img-5.png" alt="Light theme" width="48%">
+  <img src="docs/img-6.png" alt="Dark theme" width="48%">
 </p>
 
-<!-- Optional third image / تصویر سوم (اختیاری):
-<p align="center"><img src="docs/screenshots/screenshot-chapters.png" alt="Chapter statistics" width="80%"></p>
--->
-
----
-
-<a id="english"></a>
-
-# English
-
-## About
-
-EPUB Analyzer is a lightweight tool that reads an EPUB file entirely in memory and reports accurate text statistics: words, letters, characters, paragraphs, sentences, chapters, per-chapter breakdowns, book metadata, estimated reading time and page count. Persian, Arabic, English and other Latin-script languages are supported. The whole app (FastAPI backend plus HTML/CSS/JS frontend) lives in a single `main.py`, and it can also be packaged as a Windows desktop app.
-
-## Features
-
-- Drag & drop or file picker upload, with file name, size, extension and processing status
-- Structural EPUB validation (ZIP, `container.xml`, mimetype, DRM/encryption, ZIP bombs, path traversal)
-- Files are processed in memory only and never stored on disk
-- Navigation, table of contents, cover and duplicate pages are excluded from the counts
-- Metadata: title, author, publisher, language, identifier, publication date, description
-- Extra stats: average word, sentence and paragraph length, reading time (default 200 wpm) and estimated pages (default 300 words/page), both adjustable in the UI
-- Sortable, responsive chapter table
-- Light and dark themes (saved in LocalStorage)
-- Swagger UI at `/docs`
-
-## Project structure
-
-```text
-epub-analyzer/
-├── main.py            # Backend + Frontend (FastAPI)
-├── gui.py             # Windows desktop wrapper (pywebview)
-├── installer.iss      # Inno Setup script
-├── icon.ico           # App icon
-├── requirements.txt
-├── README.md
-└── docs/              # Logo and screenshots
-```
-
-## Quick start (web)
-
-Requires Python 3.11 or newer.
-
-**Windows (PowerShell)**
-
-```powershell
-python -m venv .venv
-.venv\Scripts\activate
-pip install -r requirements.txt
-uvicorn main:app --reload
-```
-
-**Linux / macOS**
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-uvicorn main:app --reload
-```
-
-Open <http://127.0.0.1:8000> (Swagger: <http://127.0.0.1:8000/docs>).
-
-## Windows desktop app
-
-`gui.py` starts the server in a background thread and shows the UI in a native window (needs the Microsoft WebView2 runtime, which ships with Windows 10/11).
-
-```powershell
-pip install pywebview pyinstaller
-python gui.py
-```
-
-**Build the `.exe`** (single line in PowerShell):
-
-```powershell
-pyinstaller --noconfirm --onefile --windowed --name EPUBAnalyzer --icon=icon.ico --collect-submodules uvicorn --hidden-import multipart gui.py
-```
-
-The executable is created at `dist\EPUBAnalyzer.exe`.
-
-**Build the installer** with [Inno Setup](https://jrsoftware.org/isinfo.php): open `installer.iss` and press *Build → Compile* (or run `ISCC installer.iss`). The setup file is written to `installer_output\`.
-
-## API
-
-| Endpoint | Description |
-|---|---|
-| `GET /` | Web UI |
-| `POST /api/analyze` | `multipart/form-data`: `file` (required), `words_per_minute`, `words_per_page` (optional). Returns `book`, `statistics`, `chapters`, `chapter_source` |
-| `GET /health` | `{"status": "ok", "service": "EPUB Analyzer"}` |
-| `GET /docs` | Swagger UI |
-
-Errors always look like `{"success": false, "error": "..."}`: `400` no/empty file, `413` file too large, `415` wrong extension, `422` invalid/corrupt/encrypted/empty EPUB, `500` internal error. Tracebacks are never exposed.
-
-```bash
-curl -F "file=@book.epub" http://127.0.0.1:8000/api/analyze
-```
-
-## How counting works
-
-Each spine document (in reading order) is parsed with BeautifulSoup into text blocks. `script`, `style`, `svg`, `img`, `nav` and `epub:type="toc|landmarks|page-list"` parts are dropped. Text is normalised with NFKC, invisible characters and tatweel are removed, whitespace is collapsed, and the Persian half-space (ZWNJ) is kept.
-
-- **Word:** a run of Unicode letters/digits (and diacritics), joined by ZWNJ, apostrophe or hyphen (`کتاب‌خوانی`, `well-known`), or a decimal/thousands number (`3.14`). Punctuation is never a word.
-- **Letters:** characters in Unicode category `L*` (no digits, spaces or punctuation).
-- **Letters with spaces:** letters plus the spaces inside the text.
-- **Characters:** with spaces, without spaces, and without spaces and punctuation (`P*`, `S*`).
-- **Paragraph:** any non-heading block with real text. Headings count towards words, letters and characters, but not paragraphs or sentences.
-- **Sentence:** ends at `. ! ? ؟ ۔ …`. Repeated marks are one boundary; abbreviations such as `Dr.` and initials such as `J.` are not boundaries.
-- **Chapter:** when the TOC matches the spine, every TOC leaf entry is a chapter and following files without an entry are merged into the previous one (chapter totals always add up to the book total). Otherwise each valid text section is reported as a chapter.
-
-## Limitations
-
-- EPUB pages are not fixed, so the page count is only an estimate.
-- Chapters are file-based: several chapters inside one file count as one.
-- DRM-protected or encrypted books are not supported.
-- Sentence detection is rule-based and may be slightly off for rare abbreviations.
-- Large uploads (over 1 MB) may be spooled to a temporary file by Starlette, which is deleted right after the request.
-
-## Configuration
-
-Edit the constants at the top of `main.py`: `MAX_UPLOAD_SIZE` (default 50 MB), `MAX_ZIP_ENTRIES`, `MAX_UNCOMPRESSED_SIZE`, `DEFAULT_WORDS_PER_MINUTE`, `DEFAULT_WORDS_PER_PAGE`.
-
-## License
-
-Add a `LICENSE` file of your choice (for example MIT) before publishing.
 
 ---
 
@@ -275,3 +159,126 @@ curl -F "file=@book.epub" http://127.0.0.1:8000/api/analyze
 پیش از انتشار، یک فایل `LICENSE` دلخواه (مثلاً MIT) به پروژه اضافه کنید.
 
 </div>
+
+---
+
+<a id="english"></a>
+
+# English
+
+## About
+
+EPUB Analyzer is a lightweight tool that reads an EPUB file entirely in memory and reports accurate text statistics: words, letters, characters, paragraphs, sentences, chapters, per-chapter breakdowns, book metadata, estimated reading time and page count. Persian, Arabic, English and other Latin-script languages are supported. The whole app (FastAPI backend plus HTML/CSS/JS frontend) lives in a single `main.py`, and it can also be packaged as a Windows desktop app.
+
+## Features
+
+- Drag & drop or file picker upload, with file name, size, extension and processing status
+- Structural EPUB validation (ZIP, `container.xml`, mimetype, DRM/encryption, ZIP bombs, path traversal)
+- Files are processed in memory only and never stored on disk
+- Navigation, table of contents, cover and duplicate pages are excluded from the counts
+- Metadata: title, author, publisher, language, identifier, publication date, description
+- Extra stats: average word, sentence and paragraph length, reading time (default 200 wpm) and estimated pages (default 300 words/page), both adjustable in the UI
+- Sortable, responsive chapter table
+- Light and dark themes (saved in LocalStorage)
+- Swagger UI at `/docs`
+
+## Project structure
+
+```text
+epub-analyzer/
+├── main.py            # Backend + Frontend (FastAPI)
+├── gui.py             # Windows desktop wrapper (pywebview)
+├── installer.iss      # Inno Setup script
+├── icon.ico           # App icon
+├── requirements.txt
+├── README.md
+└── docs/              # Logo and screenshots
+```
+
+## Quick start (web)
+
+Requires Python 3.11 or newer.
+
+**Windows (PowerShell)**
+
+```powershell
+python -m venv .venv
+.venv\Scripts\activate
+pip install -r requirements.txt
+uvicorn main:app --reload
+```
+
+**Linux / macOS**
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+uvicorn main:app --reload
+```
+
+Open <http://127.0.0.1:8000> (Swagger: <http://127.0.0.1:8000/docs>).
+
+## Windows desktop app
+
+`gui.py` starts the server in a background thread and shows the UI in a native window (needs the Microsoft WebView2 runtime, which ships with Windows 10/11).
+
+```powershell
+pip install pywebview pyinstaller
+python gui.py
+```
+
+**Build the `.exe`** (single line in PowerShell):
+
+```powershell
+pyinstaller --noconfirm --onefile --windowed --name EPUBAnalyzer --icon=icon.ico --collect-submodules uvicorn --hidden-import multipart gui.py
+```
+
+The executable is created at `dist\EPUBAnalyzer.exe`.
+
+**Build the installer** with [Inno Setup](https://jrsoftware.org/isinfo.php): open `installer.iss` and press *Build → Compile* (or run `ISCC installer.iss`). The setup file is written to `installer_output\`.
+
+## API
+
+| Endpoint | Description |
+|---|---|
+| `GET /` | Web UI |
+| `POST /api/analyze` | `multipart/form-data`: `file` (required), `words_per_minute`, `words_per_page` (optional). Returns `book`, `statistics`, `chapters`, `chapter_source` |
+| `GET /health` | `{"status": "ok", "service": "EPUB Analyzer"}` |
+| `GET /docs` | Swagger UI |
+
+Errors always look like `{"success": false, "error": "..."}`: `400` no/empty file, `413` file too large, `415` wrong extension, `422` invalid/corrupt/encrypted/empty EPUB, `500` internal error. Tracebacks are never exposed.
+
+```bash
+curl -F "file=@book.epub" http://127.0.0.1:8000/api/analyze
+```
+
+## How counting works
+
+Each spine document (in reading order) is parsed with BeautifulSoup into text blocks. `script`, `style`, `svg`, `img`, `nav` and `epub:type="toc|landmarks|page-list"` parts are dropped. Text is normalised with NFKC, invisible characters and tatweel are removed, whitespace is collapsed, and the Persian half-space (ZWNJ) is kept.
+
+- **Word:** a run of Unicode letters/digits (and diacritics), joined by ZWNJ, apostrophe or hyphen (`کتاب‌خوانی`, `well-known`), or a decimal/thousands number (`3.14`). Punctuation is never a word.
+- **Letters:** characters in Unicode category `L*` (no digits, spaces or punctuation).
+- **Letters with spaces:** letters plus the spaces inside the text.
+- **Characters:** with spaces, without spaces, and without spaces and punctuation (`P*`, `S*`).
+- **Paragraph:** any non-heading block with real text. Headings count towards words, letters and characters, but not paragraphs or sentences.
+- **Sentence:** ends at `. ! ? ؟ ۔ …`. Repeated marks are one boundary; abbreviations such as `Dr.` and initials such as `J.` are not boundaries.
+- **Chapter:** when the TOC matches the spine, every TOC leaf entry is a chapter and following files without an entry are merged into the previous one (chapter totals always add up to the book total). Otherwise each valid text section is reported as a chapter.
+
+## Limitations
+
+- EPUB pages are not fixed, so the page count is only an estimate.
+- Chapters are file-based: several chapters inside one file count as one.
+- DRM-protected or encrypted books are not supported.
+- Sentence detection is rule-based and may be slightly off for rare abbreviations.
+- Large uploads (over 1 MB) may be spooled to a temporary file by Starlette, which is deleted right after the request.
+
+## Configuration
+
+Edit the constants at the top of `main.py`: `MAX_UPLOAD_SIZE` (default 50 MB), `MAX_ZIP_ENTRIES`, `MAX_UNCOMPRESSED_SIZE`, `DEFAULT_WORDS_PER_MINUTE`, `DEFAULT_WORDS_PER_PAGE`.
+
+## License
+
+Add a `LICENSE` file of your choice (for example MIT) before publishing.
+
+---

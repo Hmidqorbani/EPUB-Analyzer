@@ -1,4 +1,4 @@
-```markdown
+
 <div align="center">
 
 <img src="docs/icon.ico" alt="EPUB Analyzer logo" width="128">
@@ -329,4 +329,3 @@ Edit the constants at the top of `main.py`:
 - `SUPPORTED_FORMATS` (default: `{.epub, .txt, .docx, .pdf, .fb2}`)
 
 ---
-```

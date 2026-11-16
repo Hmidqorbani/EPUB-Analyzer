@@ -42,14 +42,17 @@
 ---
 
 <a id="فارسی"></a>
-
+<br>
+<br>
+<br>
+<br>
 <div dir="rtl">
 
-# فارسی
 
 ## معرفی
 
-EPUB Analyzer ابزاری سبک است که فایل EPUB را کاملاً در حافظه می‌خواند و آمار دقیق متن کتاب را نشان می‌دهد: کلمه، حرف، کاراکتر، پاراگراف، جمله، فصل، آمار هر فصل، متادیتا، زمان مطالعه و تعداد صفحات تخمینی. فارسی، عربی، انگلیسی و زبان‌های لاتین پشتیبانی می‌شوند. کل برنامه (Backend با FastAPI و Frontend با HTML/CSS/JS) در یک فایل `main.py` است و می‌توان آن را به‌صورت اپ دسکتاپ ویندوز هم بسته‌بندی کرد.
+### EPUB Analyzer
+ابزاری سبک است که فایل EPUB را کاملاً در حافظه می‌خواند و آمار دقیق متن کتاب را نشان می‌دهد: کلمه، حرف، کاراکتر، پاراگراف، جمله، فصل، آمار هر فصل، متادیتا، زمان مطالعه و تعداد صفحات تخمینی. فارسی، عربی، انگلیسی و زبان‌های لاتین پشتیبانی می‌شوند. کل برنامه (Backend با FastAPI و Frontend با HTML/CSS/JS) در یک فایل `main.py` است و می‌توان آن را به‌صورت اپ دسکتاپ ویندوز هم بسته‌بندی کرد.
 
 ## ویژگی‌ها
 
@@ -158,11 +161,7 @@ curl -F "file=@book.epub" http://127.0.0.1:8000/api/analyze
 
 ثابت‌های ابتدای `main.py` را تغییر دهید: `MAX_UPLOAD_SIZE` (پیش‌فرض ۵۰ مگابایت)، `MAX_ZIP_ENTRIES`، `MAX_UNCOMPRESSED_SIZE`، `DEFAULT_WORDS_PER_MINUTE` و `DEFAULT_WORDS_PER_PAGE`.
 
-## مجوز
 
-پیش از انتشار، یک فایل `LICENSE` دلخواه (مثلاً MIT) به پروژه اضافه کنید.
-
-</div>
 
 ---
 
@@ -280,9 +279,5 @@ Each spine document (in reading order) is parsed with BeautifulSoup into text bl
 ## Configuration
 
 Edit the constants at the top of `main.py`: `MAX_UPLOAD_SIZE` (default 50 MB), `MAX_ZIP_ENTRIES`, `MAX_UNCOMPRESSED_SIZE`, `DEFAULT_WORDS_PER_MINUTE`, `DEFAULT_WORDS_PER_PAGE`.
-
-## License
-
-Add a `LICENSE` file of your choice (for example MIT) before publishing.
 
 ---

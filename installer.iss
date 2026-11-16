@@ -3,7 +3,7 @@
 ; 2) Open this file in Inno Setup and press Build > Compile (or run: ISCC installer.iss)
 
 #define MyAppName "EPUB Analyzer"
-#define MyAppVersion "1.0.0"
+#define MyAppVersion "1.2.0"
 #define MyAppExeName "EPUBAnalyzer.exe"
 
 [Setup]

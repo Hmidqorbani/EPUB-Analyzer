@@ -1,4 +1,4 @@
-"""EPUB Analyzer: تحلیل آماری فایل‌های EPUB (تک‌فایلی؛ Backend + Frontend).
+"""EPUB Analyzer: تحلیل آماری فایل‌های کتاب (EPUB, TXT, DOCX, PDF, FB2).
 
 اجرا:  uvicorn main:app --reload
 """
@@ -6,6 +6,7 @@ from __future__ import annotations
 
 # ============================== 1. Imports ==============================
 import asyncio
+import base64
 import hashlib
 import io
 import logging
@@ -24,29 +25,49 @@ from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse
 
+try:
+    from docx import Document as DocxDocument
+    _HAS_DOCX = True
+except Exception:
+    _HAS_DOCX = False
+
+try:
+    from pypdf import PdfReader
+    _HAS_PDF = True
+except Exception:
+    _HAS_PDF = False
+
+try:
+    import lxml  # noqa: F401
+    _XML_PARSER = "xml"
+except Exception:
+    _XML_PARSER = "html.parser"
+
 # ============================ 2. Configuration ==========================
 APP_NAME = "EPUB Analyzer"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.2.0"
 
-MAX_UPLOAD_SIZE = 100 * 1024 * 1024          # حداکثر حجم فایل آپلودی (بایت)
-MAX_ZIP_ENTRIES = 5000                      # حداکثر تعداد Entry در ZIP
-MAX_UNCOMPRESSED_SIZE = 400 * 1024 * 1024   # حداکثر مجموع حجم بعد از Extract
-MAX_ENTRY_SIZE = 100 * 1024 * 1024          # حداکثر حجم هر Entry
-MAX_COMPRESSION_RATIO = 1000                # نسبت فشرده‌سازی مشکوک (ZIP Bomb)
+MAX_UPLOAD_SIZE = 100 * 1024 * 1024
+MAX_ZIP_ENTRIES = 5000
+MAX_UNCOMPRESSED_SIZE = 400 * 1024 * 1024
+MAX_ENTRY_SIZE = 100 * 1024 * 1024
+MAX_COMPRESSION_RATIO = 1000
+MAX_PDF_PAGES = 3000
+MAX_COVER_BYTES = 3 * 1024 * 1024
 DEFAULT_WORDS_PER_MINUTE = 200
 DEFAULT_WORDS_PER_PAGE = 300
+
+SUPPORTED_FORMATS = {".epub", ".txt", ".docx", ".pdf", ".fb2"}
 
 logger = logging.getLogger("epub_analyzer")
 warnings.filterwarnings("ignore", module="ebooklib")
 
 # ======================== 3. FastAPI App Initialization =================
 app = FastAPI(title=APP_NAME, version=APP_VERSION,
-              description="Upload an EPUB file and get detailed text statistics.")
+              description="Upload a book file (EPUB/TXT/DOCX/PDF/FB2) and get detailed text statistics.")
 
 
 class AnalyzerError(Exception):
-    """خطای قابل نمایش به کاربر همراه با کد HTTP."""
-
     def __init__(self, status: int, message: str):
         super().__init__(message)
         self.status = status
@@ -66,12 +87,17 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
 <title>EPUB Analyzer</title>
 <script>
 (function () {
-  var t = null;
-  try { t = localStorage.getItem('theme'); } catch (e) {}
+  var t = null, l = null;
+  try { t = localStorage.getItem('theme'); l = localStorage.getItem('lang'); } catch (e) {}
   if (t !== 'dark' && t !== 'light') {
     t = window.matchMedia && matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
   }
+  if (l !== 'fa' && l !== 'en') {
+    l = (navigator.language || '').toLowerCase().startsWith('fa') ? 'fa' : 'en';
+  }
   document.documentElement.dataset.theme = t;
+  document.documentElement.lang = l;
+  document.documentElement.dir = l === 'fa' ? 'rtl' : 'ltr';
 })();
 </script>
 <style>
@@ -104,11 +130,14 @@ body {
 .brand svg { width: 46px; height: 46px; flex: none; }
 .brand h1 { margin: 0; font-size: 1.45rem; line-height: 1.2; letter-spacing: -.01em; }
 .brand p { margin: .15rem 0 0; color: var(--muted); font-size: .92rem; }
+.toolbar { display: flex; gap: .5rem; }
 button { font: inherit; color: inherit; cursor: pointer; }
 :focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
 .icon-btn { width: 44px; height: 44px; border-radius: 14px; border: 1px solid var(--line); background: var(--glass);
   backdrop-filter: blur(10px); display: grid; place-items: center; }
 .icon-btn svg { width: 20px; height: 20px; }
+.lang-btn { width: 44px; height: 44px; border-radius: 14px; border: 1px solid var(--line); background: var(--glass);
+  display: grid; place-items: center; font-weight: 700; font-size: .85rem; }
 .card { background: var(--glass); border: 1px solid var(--line); border-radius: 20px; box-shadow: var(--shadow);
   backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); padding: 1.4rem; }
 h2 { margin: 0 0 1rem; font-size: 1.1rem; }
@@ -138,6 +167,10 @@ h2 { margin: 0 0 1rem; font-size: 1.1rem; }
 [hidden] { display: none !important; }
 #results { display: grid; gap: 1.2rem; margin-top: 1.4rem; animation: rise .45s ease both; }
 @keyframes rise { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: none; } }
+.book-layout { display: flex; gap: 1.4rem; align-items: flex-start; flex-wrap: wrap; }
+.book-layout .cover { max-width: 170px; max-height: 260px; border-radius: 12px; box-shadow: var(--shadow);
+  flex: none; display: block; object-fit: contain; }
+.book-layout dl.meta { flex: 1; min-width: 220px; }
 dl.meta { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: .9rem 1.4rem; margin: 0; }
 dl.meta dt { color: var(--muted); font-size: .82rem; }
 dl.meta dd { margin: 0; font-weight: 500; overflow-wrap: anywhere; }
@@ -158,7 +191,7 @@ dd.none { color: var(--muted); font-weight: 400; }
   background: var(--bg); color: var(--ink); font: inherit; }
 .note { margin: 1rem 0 0; color: var(--muted); font-size: .85rem; }
 .tablewrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 14px; background: var(--solid); }
-table { width: 100%; border-collapse: collapse; min-width: 560px; }
+table { width: 100%; border-collapse: collapse; min-width: 640px; }
 th, td { padding: .7rem .9rem; text-align: start; border-bottom: 1px solid var(--line); white-space: nowrap; }
 td.title { white-space: normal; min-width: 14rem; }
 tr:last-child td { border-bottom: 0; }
@@ -177,61 +210,239 @@ footer { text-align: center; color: var(--muted); font-size: .85rem; padding: 2r
       <svg viewBox="0 0 48 48" aria-hidden="true"><rect x="2" y="2" width="44" height="44" rx="13" fill="var(--accent)"/>
         <path d="M14 14h13a5 5 0 0 1 5 5v15H19a5 5 0 0 1-5-5V14Z" fill="none" stroke="var(--on-accent)" stroke-width="2.4" stroke-linejoin="round"/>
         <path d="M19 21h8M19 26h8" stroke="var(--on-accent)" stroke-width="2.4" stroke-linecap="round"/></svg>
-      <div><h1>EPUB Analyzer</h1><p>کلمه‌ها، حرف‌ها، جمله‌ها و فصل‌های کتاب EPUB را بشمارید.</p></div>
+      <div><h1>EPUB Analyzer</h1><p data-i18n="tagline"></p></div>
     </div>
-    <button class="icon-btn" id="theme" type="button" aria-label="تغییر تم روشن/تیره" title="تغییر تم">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8Z"/></svg>
-    </button>
+    <div class="toolbar">
+      <button class="lang-btn" id="lang" type="button" aria-label="Language / زبان">EN</button>
+      <button class="icon-btn" id="theme" type="button" data-i18n-aria="theme_toggle" data-i18n-title="theme_toggle" title="">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8Z"/></svg>
+      </button>
+    </div>
   </header>
 
   <main>
-    <section class="card drop" id="drop" aria-label="آپلود فایل EPUB">
+    <section class="card drop" id="drop" data-i18n-aria="drop_aria">
       <svg class="book" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 5.5A2.5 2.5 0 0 1 6.5 3H20v16H6.5A2.5 2.5 0 0 0 4 21.5v-16Z"/><path d="M4 21.5A2.5 2.5 0 0 1 6.5 19H20v2H6.5"/><path d="M9 8h7M9 12h5"/></svg>
-      <h2>فایل EPUB را اینجا رها کنید</h2>
-      <p class="hint">یا از دکمه زیر برای انتخاب فایل استفاده کنید.</p>
-      <div class="actions"><button class="btn" id="pick" type="button">انتخاب فایل</button></div>
-      <p class="hint">فرمت پشتیبانی‌شده: EPUB. حداکثر حجم: __MAX_MB__ مگابایت.</p>
-      <input type="file" id="input" accept=".epub,application/epub+zip" hidden>
+      <h2 data-i18n="drop_title"></h2>
+      <p class="hint" data-i18n="drop_hint"></p>
+      <div class="actions"><button class="btn" id="pick" type="button" data-i18n="pick"></button></div>
+      <p class="hint" id="format_hint"></p>
+      <input type="file" id="input" accept=".epub,.txt,.docx,.pdf,.fb2,application/epub+zip,text/plain,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/pdf,application/x-fictionbook+xml" hidden>
       <div class="fileinfo" id="fileinfo" hidden>
         <div class="name" id="fname"></div>
         <div class="chips"><span class="chip" id="fsize"></span><span class="chip" id="fext"></span></div>
         <div class="status" id="status"></div>
         <div class="actions" style="justify-content:flex-start">
-          <button class="btn ghost" id="again" type="button">تحلیل مجدد</button>
-          <button class="btn ghost" id="other" type="button">انتخاب فایل دیگر</button>
+          <button class="btn ghost" id="again" type="button" data-i18n="again"></button>
+          <button class="btn ghost" id="other" type="button" data-i18n="other"></button>
         </div>
       </div>
     </section>
-    <div class="error" id="error" role="alert" hidden><span id="errmsg"></span><button class="btn" id="retry" type="button">تلاش مجدد</button></div>
+    <div class="error" id="error" role="alert" hidden><span id="errmsg"></span><button class="btn" id="retry" type="button" data-i18n="retry"></button></div>
 
     <div id="results" hidden>
-      <section class="card"><h2>اطلاعات کتاب</h2><dl class="meta" id="meta"></dl></section>
+      <section class="card">
+        <h2 data-i18n="book_info"></h2>
+        <div class="book-layout">
+          <img class="cover" id="cover" alt="cover" hidden>
+          <dl class="meta" id="meta"></dl>
+        </div>
+      </section>
       <section><div class="grid" id="stats"></div></section>
-      <section class="card"><h2>آمار تکمیلی</h2><div class="grid" id="extra"></div>
+      <section class="card"><h2 data-i18n="extra_stats"></h2><div class="grid" id="extra"></div>
         <p class="note" id="note"></p></section>
-      <section class="card"><h2>آمار فصل‌ها</h2>
+      <section class="card"><h2 data-i18n="chapter_stats"></h2>
         <div class="tablewrap"><table><thead><tr>
-          <th scope="col">#</th><th scope="col">عنوان فصل</th>
-          <th scope="col" id="wordsTh" aria-sort="none"><button type="button" id="sortWords" title="مرتب‌سازی بر اساس تعداد کلمات">کلمات <span id="arrow">⇅</span></button></th>
-          <th scope="col">حروف</th><th scope="col">پاراگراف‌ها</th><th scope="col">جمله‌ها</th>
+          <th scope="col">#</th><th scope="col" data-i18n="th_title"></th>
+          <th scope="col" id="wordsTh" aria-sort="none"><button type="button" id="sortWords" data-i18n-title="sort_words"><span data-i18n="th_words"></span> <span id="arrow">⇅</span></button></th>
+          <th scope="col" data-i18n="th_letters"></th>
+          <th scope="col" data-i18n="th_paras"></th>
+          <th scope="col" data-i18n="th_sents"></th>
+          <th scope="col" data-i18n="th_rt"></th>
         </tr></thead><tbody id="rows"></tbody></table></div>
         <p class="note" id="chnote"></p></section>
     </div>
   </main>
   <footer>
     <a href="https://github.com/Hmidqorbani" target="_blank" rel="noopener noreferrer">Hmidqorbani</a>
-    <span> — EPUB Analyzer، نسخه __VERSION__</span>
+    <span> — EPUB Analyzer، __VERSION__</span>
   </footer>
 </div>
 
 <script>
 (() => {
   const MAX = __MAX_BYTES__;
+  const ALLOWED = ['epub', 'txt', 'docx', 'pdf', 'fb2'];
   const $ = s => document.querySelector(s);
   const nf = new Intl.NumberFormat('fa-IR', { maximumFractionDigits: 2 });
-  const fmt = n => (n === null || n === undefined) ? '—' : nf.format(n);
+  const nfEn = new Intl.NumberFormat('en-US', { maximumFractionDigits: 2 });
   const root = document.documentElement;
   let file = null, data = null, sortMode = 'none';
+  let lang = root.lang === 'fa' ? 'fa' : 'en';
+
+  const I18N = {
+    fa: {
+      tagline: 'کلمه‌ها، حرف‌ها، جمله‌ها و فصل‌های کتاب را بشمارید.',
+      drop_title: 'فایل کتاب را اینجا رها کنید',
+      drop_hint: 'یا از دکمه زیر برای انتخاب فایل استفاده کنید.',
+      drop_aria: 'آپلود فایل کتاب',
+      pick: 'انتخاب فایل', again: 'تحلیل مجدد', other: 'انتخاب فایل دیگر',
+      retry: 'تلاش مجدد', theme_toggle: 'تغییر تم روشن/تیره',
+      analyzing: 'در حال تحلیل کتاب…', done: 'تحلیل کامل شد.',
+      book_info: 'اطلاعات کتاب', extra_stats: 'آمار تکمیلی', chapter_stats: 'آمار فصل‌ها',
+      title: 'عنوان', author: 'نویسنده', publisher: 'ناشر', language: 'زبان کتاب',
+      identifier: 'شناسه', pub_date: 'تاریخ انتشار', description: 'توضیحات',
+      detected_lang: 'زبان تشخیص‌داده‌شده', not_recorded: 'ثبت نشده',
+      words: 'کلمات', characters: 'کاراکترها (با فاصله)', chars_no_space: 'کاراکترها بدون فاصله',
+      letters: 'حروف', letters_spaces: 'حروف با فاصله', paragraphs: 'پاراگراف‌ها',
+      sentences: 'جمله‌ها', chapters: 'فصل‌ها',
+      avg_word_len: 'میانگین طول کلمه (حرف)', avg_sent_len: 'میانگین طول جمله (کلمه)',
+      avg_para_words: 'میانگین کلمات هر پاراگراف', chars_clean: 'کاراکتر بدون فاصله و علائم',
+      reading_time: 'زمان مطالعه', est_pages: 'تعداد صفحات تخمینی',
+      wpm_label: 'کلمه در دقیقه', wpp_label: 'کلمه در صفحه',
+      note_extra: 'زمان مطالعه = کل کلمات ÷ سرعت مطالعه. صفحه‌های EPUB ثابت نیستند و تعداد صفحات فقط یک تخمین بر اساس تعداد کلمه است.',
+      th_title: 'عنوان فصل', th_words: 'کلمات', th_letters: 'حروف', th_paras: 'پاراگراف‌ها', th_sents: 'جمله‌ها', th_rt: 'زمان مطالعه',
+      sort_words: 'مرتب‌سازی بر اساس تعداد کلمات',
+      ch_note_toc: 'فصل‌ها بر اساس فهرست مطالب (TOC) و ترتیب خوانش (Spine) تعیین شده‌اند؛ از جمله تقسیم فایل‌های چندفصلی بر اساس Anchorها.',
+      ch_note_headings: 'این کتاب فهرست مطالب مشخصی ندارد؛ فصل‌ها بر اساس تیترهای (Heading) داخل فایل‌ها تقسیم شده‌اند.',
+      ch_note_spine: 'این کتاب فصل‌بندی مشخصی ندارد؛ هر بخش متنی معتبر به‌عنوان یک فصل گزارش شده است.',
+      ch_note_single: 'این فرمت معمولاً ساختار فصل ندارد و کل کتاب یک فصل در نظر گرفته می‌شود.',
+      err_conn: 'ارتباط با سرور برقرار نشد.', err_ext: 'فرمت فایل پشتیبانی نمی‌شود.',
+      err_empty: 'فایل انتخاب‌شده خالی است.', err_size: 'حجم فایل بیش از حد مجاز است.',
+      err_generic: 'تحلیل فایل انجام نشد.',
+      lang_fa: 'فارسی', lang_ar: 'عربی', lang_en: 'انگلیسی', lang_ru: 'روسی', lang_zh: 'چینی', lang_unknown: 'نامشخص',
+      unit_byte: 'بایت', unit_kb: 'کیلوبایت', unit_mb: 'مگابایت',
+      hour: 'ساعت', minute: 'دقیقه', less_min: 'کمتر از ۱ دقیقه', and: ' و ',
+      format_hint_tpl: 'فرمت‌های پشتیبانی‌شده: EPUB، TXT، DOCX، PDF، FB2. حداکثر حجم: __MAX_MB__ مگابایت.'
+    },
+    en: {
+      tagline: 'Count the words, letters, sentences and chapters of any book.',
+      drop_title: 'Drop your book file here',
+      drop_hint: 'Or use the button below to select a file.',
+      drop_aria: 'Upload book file',
+      pick: 'Choose file', again: 'Analyze again', other: 'Choose another file',
+      retry: 'Retry', theme_toggle: 'Toggle light/dark theme',
+      analyzing: 'Analyzing book…', done: 'Analysis complete.',
+      book_info: 'Book information', extra_stats: 'Extra statistics', chapter_stats: 'Chapter statistics',
+      title: 'Title', author: 'Author', publisher: 'Publisher', language: 'Language',
+      identifier: 'Identifier', pub_date: 'Publication date', description: 'Description',
+      detected_lang: 'Detected language', not_recorded: 'Not recorded',
+      words: 'Words', characters: 'Characters (with spaces)', chars_no_space: 'Characters without spaces',
+      letters: 'Letters', letters_spaces: 'Letters with spaces', paragraphs: 'Paragraphs',
+      sentences: 'Sentences', chapters: 'Chapters',
+      avg_word_len: 'Avg. word length (letters)', avg_sent_len: 'Avg. sentence length (words)',
+      avg_para_words: 'Avg. words per paragraph', chars_clean: 'Chars without spaces & punctuation',
+      reading_time: 'Reading time', est_pages: 'Estimated pages',
+      wpm_label: 'words / minute', wpp_label: 'words / page',
+      note_extra: 'Reading time = total words ÷ reading speed. EPUB pages are not fixed; page count is only an estimate based on word count.',
+      th_title: 'Chapter title', th_words: 'Words', th_letters: 'Letters', th_paras: 'Paragraphs', th_sents: 'Sentences', th_rt: 'Reading time',
+      sort_words: 'Sort by word count',
+      ch_note_toc: 'Chapters are determined from the table of contents (TOC) and reading order (Spine), including splitting multi-chapter files by anchors.',
+      ch_note_headings: 'This book has no clear table of contents; chapters were split by in-file headings.',
+      ch_note_spine: 'This book has no chapter structure; each valid text section is reported as a chapter.',
+      ch_note_single: 'This format usually has no chapter structure, so the whole book is treated as one chapter.',
+      err_conn: 'Could not reach the server.', err_ext: 'File format not supported.',
+      err_empty: 'Selected file is empty.', err_size: 'File size exceeds the limit.',
+      err_generic: 'Analysis failed.',
+      lang_fa: 'Persian', lang_ar: 'Arabic', lang_en: 'English', lang_ru: 'Russian', lang_zh: 'Chinese', lang_unknown: 'Unknown',
+      unit_byte: 'B', unit_kb: 'KB', unit_mb: 'MB',
+      hour: 'h', minute: 'min', less_min: 'Less than 1 min', and: ' ',
+      format_hint_tpl: 'Supported formats: EPUB, TXT, DOCX, PDF, FB2. Max size: __MAX_MB__ MB.'
+    }
+  };
+  const t = k => (I18N[lang] && I18N[lang][k]) || k;
+  const num = n => (n === null || n === undefined) ? '—' : (lang === 'fa' ? nf : nfEn).format(n);
+
+  const LANG_NAMES = {
+    fa: () => t('lang_fa'), ar: () => t('lang_ar'), en: () => t('lang_en'),
+    ru: () => t('lang_ru'), zh: () => t('lang_zh'), unknown: () => t('lang_unknown')
+  };
+
+  function applyStaticI18n() {
+    root.lang = lang;
+    root.dir = lang === 'fa' ? 'rtl' : 'ltr';
+    for (const el of document.querySelectorAll('[data-i18n]')) {
+      const key = el.dataset.i18n;
+      if (I18N[lang][key] !== undefined) el.textContent = I18N[lang][key];
+    }
+    for (const el of document.querySelectorAll('[data-i18n-title]')) {
+      const key = el.dataset.i18nTitle;
+      if (I18N[lang][key] !== undefined) el.title = I18N[lang][key];
+    }
+    for (const el of document.querySelectorAll('[data-i18n-aria]')) {
+      const key = el.dataset.i18nAria;
+      if (I18N[lang][key] !== undefined) el.setAttribute('aria-label', I18N[lang][key]);
+    }
+    $('#lang').textContent = lang === 'fa' ? 'EN' : 'FA';
+    $('#format_hint').textContent = t('format_hint_tpl').replace('__MAX_MB__', num(Math.round(MAX / 1048576)));
+  }
+
+  $('#lang').onclick = () => {
+    lang = lang === 'fa' ? 'en' : 'fa';
+    try { localStorage.setItem('lang', lang); } catch (e) {}
+    applyStaticI18n();
+    if (data) render();
+  };
+
+  $('#theme').onclick = () => {
+    const th = root.dataset.theme === 'dark' ? 'light' : 'dark';
+    root.dataset.theme = th;
+    try { localStorage.setItem('theme', th); } catch (e) {}
+  };
+
+  const bytesText = b => b < 1024 ? num(b) + ' ' + t('unit_byte')
+    : b < 1048576 ? num(+(b / 1024).toFixed(2)) + ' ' + t('unit_kb')
+    : num(+(b / 1048576).toFixed(2)) + ' ' + t('unit_mb');
+  const showError = m => { $('#errmsg').textContent = m; $('#error').hidden = false; $('#retry').hidden = !file; };
+  const hideError = () => { $('#error').hidden = true; };
+  const setBusy = on => {
+    $('#again').disabled = $('#other').disabled = $('#pick').disabled = on;
+    $('#status').replaceChildren();
+    if (on) {
+      const s = document.createElement('span'); s.className = 'spin';
+      $('#status').append(s, t('analyzing'));
+    }
+  };
+
+  function setFile(f) {
+    hideError();
+    const ext = (f.name.includes('.') ? f.name.split('.').pop() : '').toLowerCase();
+    if (!ALLOWED.includes(ext)) return showError(t('err_ext'));
+    if (f.size === 0) return showError(t('err_empty'));
+    if (f.size > MAX) return showError(t('err_size'));
+    file = f;
+    $('#fname').textContent = f.name;
+    $('#fsize').textContent = bytesText(f.size);
+    $('#fext').textContent = ext.toUpperCase();
+    $('#fileinfo').hidden = false;
+    analyze();
+  }
+
+  async function analyze() {
+    if (!file) return;
+    hideError(); setBusy(true);
+    const fd = new FormData();
+    fd.append('file', file);
+    fd.append('words_per_minute', $('#wpm') ? $('#wpm').value || 200 : 200);
+    fd.append('words_per_page', $('#wpp') ? $('#wpp').value || 300 : 300);
+    let msg = t('err_conn');
+    try {
+      const r = await fetch('/api/analyze', { method: 'POST', body: fd });
+      let j = null;
+      try { j = await r.json(); } catch (e) {}
+      if (!r.ok || !j || !j.success) { msg = (j && j.error) || t('err_generic'); throw new Error(); }
+      data = j; render();
+      $('#status').textContent = t('done');
+      $('#results').hidden = false;
+      $('#results').scrollIntoView({ behavior: 'smooth', block: 'start' });
+    } catch (e) {
+      $('#status').replaceChildren(); $('#results').hidden = true;
+      showError(msg);
+    } finally {
+      $('#again').disabled = $('#other').disabled = $('#pick').disabled = false;
+      if ($('#status').querySelector('.spin')) $('#status').replaceChildren();
+    }
+  }
 
   const ICONS = {
     words: '<path d="M4 7V5h16v2M12 5v14M9 19h6"/>',
@@ -245,101 +456,55 @@ footer { text-align: center; color: var(--muted); font-size: .85rem; padding: 2r
   };
   const svg = p => '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' + p + '</svg>';
 
-  // ----- Theme -----
-  $('#theme').onclick = () => {
-    const t = root.dataset.theme === 'dark' ? 'light' : 'dark';
-    root.dataset.theme = t;
-    try { localStorage.setItem('theme', t); } catch (e) {}
-  };
-
-  // ----- Helpers -----
-  const bytesText = b => b < 1024 ? fmt(b) + ' بایت' : b < 1048576 ? fmt(b / 1024) + ' کیلوبایت' : fmt(b / 1048576) + ' مگابایت';
-  const showError = m => { $('#errmsg').textContent = m; $('#error').hidden = false; $('#retry').hidden = !file; };
-  const hideError = () => { $('#error').hidden = true; };
-  const setBusy = on => {
-    $('#again').disabled = $('#other').disabled = $('#pick').disabled = on;
-    $('#status').replaceChildren();
-    if (on) {
-      const s = document.createElement('span'); s.className = 'spin';
-      $('#status').append(s, 'در حال تحلیل کتاب…');
-    }
-  };
-
-  function setFile(f) {
-    hideError();
-    const ext = (f.name.includes('.') ? f.name.split('.').pop() : '').toLowerCase();
-    if (ext !== 'epub') return showError('فقط فایل با پسوند EPUB پذیرفته می‌شود.');
-    if (f.size === 0) return showError('فایل انتخاب‌شده خالی است.');
-    if (f.size > MAX) return showError('حجم فایل بیشتر از ' + fmt(MAX / 1048576) + ' مگابایت است.');
-    file = f;
-    $('#fname').textContent = f.name;
-    $('#fsize').textContent = 'حجم: ' + bytesText(f.size);
-    $('#fext').textContent = 'پسوند: ' + ext.toUpperCase();
-    $('#fileinfo').hidden = false;
-    analyze();
-  }
-
-  async function analyze() {
-    if (!file) return;
-    hideError(); setBusy(true);
-    const fd = new FormData();
-    fd.append('file', file);
-    fd.append('words_per_minute', $('#wpm') ? $('#wpm').value || 200 : 200);
-    fd.append('words_per_page', $('#wpp') ? $('#wpp').value || 300 : 300);
-    let msg = 'ارتباط با سرور برقرار نشد. دوباره تلاش کنید.';
-    try {
-      const r = await fetch('/api/analyze', { method: 'POST', body: fd });
-      let j = null;
-      try { j = await r.json(); } catch (e) {}
-      if (!r.ok || !j || !j.success) { msg = (j && j.error) || 'تحلیل فایل انجام نشد.'; throw new Error(); }
-      data = j; render();
-      $('#status').textContent = 'تحلیل کامل شد.';
-      $('#results').hidden = false;
-      $('#results').scrollIntoView({ behavior: 'smooth', block: 'start' });
-    } catch (e) {
-      $('#status').replaceChildren(); $('#results').hidden = true;
-      showError(msg);
-    } finally {
-      $('#again').disabled = $('#other').disabled = $('#pick').disabled = false;
-      if ($('#status').firstChild && $('#status').querySelector('.spin')) $('#status').replaceChildren();
-    }
-  }
-
-  // ----- Rendering -----
   function render() {
     const b = data.book, s = data.statistics;
+
+    const cover = $('#cover');
+    if (data.cover) { cover.src = data.cover; cover.hidden = false; }
+    else { cover.hidden = true; cover.removeAttribute('src'); }
+
     const meta = $('#meta'); meta.replaceChildren();
-    [['عنوان', b.title], ['نویسنده', b.author], ['ناشر', b.publisher], ['زبان', b.language],
-     ['شناسه', b.identifier], ['تاریخ انتشار', b.publication_date], ['توضیحات', b.description, true]].forEach(([k, v, wide]) => {
+    const detName = LANG_NAMES[b.detected_language] ? LANG_NAMES[b.detected_language]() : (b.detected_language || '—');
+    const rows = [
+      ['title', b.title], ['author', b.author], ['publisher', b.publisher],
+      ['language', b.language], ['detected_lang', detName],
+      ['identifier', b.identifier], ['pub_date', b.publication_date],
+      ['description', b.description, true]
+    ];
+    rows.forEach(([k, v, wide]) => {
       const row = document.createElement('div'), dt = document.createElement('dt'), dd = document.createElement('dd');
-      dt.textContent = k; dd.textContent = v || 'ثبت نشده';
+      dt.textContent = t(k); dd.textContent = v || t('not_recorded');
       if (!v) dd.className = 'none';
       if (wide) row.className = 'wide';
       row.append(dt, dd); meta.append(row);
     });
+
     const cards = [
-      ['words', 'Words', 'کلمات', s.words], ['chars', 'Characters', 'کاراکترها (با فاصله)', s.characters],
-      ['nospace', 'Characters Without Spaces', 'کاراکترها بدون فاصله', s.characters_without_spaces],
-      ['letters', 'Letters', 'حروف', s.letters], ['lettersws', 'Letters With Spaces', 'حروف با فاصله', s.letters_with_spaces],
-      ['paragraphs', 'Paragraphs', 'پاراگراف‌ها', s.paragraphs], ['sentences', 'Sentences', 'جمله‌ها', s.sentences],
-      ['chapters', 'Chapters', 'فصل‌ها', s.chapters]];
+      ['words', t('words'), s.words], ['chars', t('characters'), s.characters],
+      ['nospace', t('chars_no_space'), s.characters_without_spaces],
+      ['letters', t('letters'), s.letters], ['lettersws', t('letters_spaces'), s.letters_with_spaces],
+      ['paragraphs', t('paragraphs'), s.paragraphs], ['sentences', t('sentences'), s.sentences],
+      ['chapters', t('chapters'), s.chapters]];
     const grid = $('#stats'); grid.replaceChildren();
-    cards.forEach(([ic, en, fa, v]) => {
-      const el = document.createElement('div'); el.className = 'card stat'; el.title = en;
+    cards.forEach(([ic, lbl, v]) => {
+      const el = document.createElement('div'); el.className = 'card stat';
       el.innerHTML = '<div class="ico">' + svg(ICONS[ic]) + '</div><div><div class="val"></div><div class="lbl"></div></div>';
-      el.querySelector('.val').textContent = fmt(v); el.querySelector('.lbl').textContent = fa;
+      el.querySelector('.val').textContent = num(v); el.querySelector('.lbl').textContent = lbl;
       grid.append(el);
     });
+
     renderExtra(); renderRows();
-    $('#chnote').textContent = data.chapter_source === 'toc'
-      ? 'فصل‌ها بر اساس فهرست مطالب (TOC) کتاب و ترتیب خوانش (Spine) تعیین شده‌اند.'
-      : 'این کتاب فصل‌بندی مشخصی ندارد؛ هر بخش متنی معتبر به‌عنوان یک فصل گزارش شده است.';
+    const src = data.chapter_source;
+    $('#chnote').textContent = src === 'toc' ? t('ch_note_toc')
+      : src === 'headings' ? t('ch_note_headings')
+      : src === 'single' ? t('ch_note_single')
+      : t('ch_note_spine');
   }
 
-  function mini(label, value, input) {
+  function mini(lbl, value, input) {
     const el = document.createElement('div'); el.className = 'mini';
     el.innerHTML = '<div class="val"></div><div class="lbl"></div>';
-    el.querySelector('.val').textContent = value; el.querySelector('.lbl').textContent = label;
+    el.querySelector('.val').textContent = value; el.querySelector('.lbl').textContent = lbl;
     if (input) el.append(input);
     return el;
   }
@@ -352,12 +517,12 @@ footer { text-align: center; color: var(--muted); font-size: .85rem; padding: 2r
     const s = data.statistics, ex = $('#extra');
     const wpm = $('#wpm') ? $('#wpm').value : s.words_per_minute, wpp = $('#wpp') ? $('#wpp').value : s.words_per_page;
     ex.replaceChildren(
-      mini('میانگین طول کلمه (حرف)', fmt(s.average_word_length)),
-      mini('میانگین طول جمله (کلمه)', fmt(s.average_sentence_length)),
-      mini('میانگین کلمات هر پاراگراف', fmt(s.average_paragraph_words)),
-      mini('کاراکتر بدون فاصله و علائم', fmt(s.characters_without_spaces_and_punctuation)),
-      mini('زمان مطالعه', '', field('wpm', 'کلمه در دقیقه', wpm, 5000)),
-      mini('تعداد صفحات تخمینی', '', field('wpp', 'کلمه در صفحه', wpp, 10000)));
+      mini(t('avg_word_len'), num(s.average_word_length)),
+      mini(t('avg_sent_len'), num(s.average_sentence_length)),
+      mini(t('avg_para_words'), num(s.average_paragraph_words)),
+      mini(t('chars_clean'), num(s.characters_without_spaces_and_punctuation)),
+      mini(t('reading_time'), '', field('wpm', t('wpm_label'), wpm, 5000)),
+      mini(t('est_pages'), '', field('wpp', t('wpp_label'), wpp, 10000)));
     ex.children[4].id = 'rt'; ex.children[5].id = 'pg';
     updateEstimates();
   }
@@ -365,9 +530,13 @@ footer { text-align: center; color: var(--muted); font-size: .85rem; padding: 2r
     const w = data.statistics.words;
     const wpm = Math.max(1, +$('#wpm').value || 200), wpp = Math.max(1, +$('#wpp').value || 300);
     const total = Math.round(w / wpm), h = Math.floor(total / 60), m = total % 60;
-    $('#rt .val').textContent = total === 0 ? 'کمتر از ۱ دقیقه' : (h ? fmt(h) + ' ساعت' : '') + (h && m ? ' و ' : '') + (m ? fmt(m) + ' دقیقه' : '');
-    $('#pg .val').textContent = fmt(Math.ceil(w / wpp));
-    $('#note').textContent = 'زمان مطالعه = کل کلمات ÷ سرعت مطالعه. صفحه‌های EPUB ثابت نیستند و تعداد صفحات فقط یک تخمین بر اساس تعداد کلمه است.';
+    let rt;
+    if (total === 0) rt = t('less_min');
+    else if (lang === 'fa') rt = (h ? num(h) + ' ' + t('hour') : '') + (h && m ? t('and') : '') + (m ? num(m) + ' ' + t('minute') : '');
+    else rt = (h ? h + t('hour') : '') + (h && m ? ' ' + t('and') + ' ' : '') + (m ? m + ' ' + t('minute') : '');
+    $('#rt .val').textContent = rt;
+    $('#pg .val').textContent = num(Math.ceil(w / wpp));
+    $('#note').textContent = t('note_extra');
   }
 
   function renderRows() {
@@ -379,15 +548,19 @@ footer { text-align: center; color: var(--muted); font-size: .85rem; padding: 2r
     const tb = $('#rows'); tb.replaceChildren();
     list.forEach(c => {
       const tr = document.createElement('tr');
-      [fmt(c.index), c.title, fmt(c.words), fmt(c.letters), fmt(c.paragraphs), fmt(c.sentences)].forEach((t, i) => {
-        const td = document.createElement('td'); td.textContent = t; if (i === 1) td.className = 'title'; tr.append(td);
+      const rt = c.reading_time_minutes;
+      const rtText = rt > 0 ? (rt < 1 ? '<1' : num(rt)) + ' ' + t('minute') : '—';
+      [num(c.index), c.title, num(c.words), num(c.letters), num(c.paragraphs), num(c.sentences), rtText].forEach((txt, i) => {
+        const td = document.createElement('td'); td.textContent = txt; if (i === 1) td.className = 'title'; tr.append(td);
       });
       tb.append(tr);
     });
   }
-  $('#sortWords').onclick = () => { sortMode = sortMode === 'none' ? 'desc' : sortMode === 'desc' ? 'asc' : 'none'; renderRows(); };
+  $('#sortWords').onclick = () => {
+    sortMode = sortMode === 'none' ? 'desc' : sortMode === 'desc' ? 'asc' : 'none';
+    renderRows();
+  };
 
-  // ----- Upload events -----
   const input = $('#input'), drop = $('#drop');
   $('#pick').onclick = $('#other').onclick = () => input.click();
   $('#again').onclick = $('#retry').onclick = analyze;
@@ -396,6 +569,8 @@ footer { text-align: center; color: var(--muted); font-size: .85rem; padding: 2r
   ['dragleave', 'drop'].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.remove('over'); }));
   drop.addEventListener('drop', e => { if (e.dataTransfer.files[0]) setFile(e.dataTransfer.files[0]); });
   ['dragover', 'drop'].forEach(ev => window.addEventListener(ev, e => e.preventDefault()));
+
+  applyStaticI18n();
 })();
 </script>
 </body>
@@ -407,9 +582,9 @@ PAGE_HTML = (PAGE_TEMPLATE
              .replace("__MAX_BYTES__", str(MAX_UPLOAD_SIZE))
              .replace("__VERSION__", APP_VERSION))
 
+
 # ========================== 7. Utility Functions ========================
 def nonneg_int(value: int, default: int, upper: int) -> int:
-    """مقدار تنظیمات را به بازه معتبر محدود می‌کند."""
     return default if value is None or value < 1 else min(value, upper)
 
 
@@ -420,12 +595,16 @@ def clean_str(value) -> str | None:
     return text or None
 
 
+def _filename_to_title(filename: str | None) -> str:
+    base = posixpath.basename(filename or "").rsplit(".", 1)[0]
+    return clean_str(base.replace("_", " ").replace("-", " ")) or "کتاب"
+
+
 # ========================== 8. EPUB Validation ==========================
 _FONT_OBFUSCATION = ("http://www.idpf.org/2008/embedding", "http://ns.adobe.com/pdf/enc#RC")
 
 
 def validate_epub(data: bytes) -> None:
-    """ساختار ZIP و EPUB را بدون استخراج روی دیسک بررسی می‌کند."""
     buf = io.BytesIO(data)
     if not zipfile.is_zipfile(buf):
         raise AnalyzerError(422, "این فایل یک EPUB معتبر نیست (ساختار ZIP تشخیص داده نشد).")
@@ -433,118 +612,47 @@ def validate_epub(data: bytes) -> None:
         with zipfile.ZipFile(buf) as zf:
             infos = zf.infolist()
             if len(infos) > MAX_ZIP_ENTRIES:
-                raise AnalyzerError(422, "تعداد فایل‌های داخل EPUB غیرعادی است و پردازش نمی‌شود.")
+                raise AnalyzerError(422, "تعداد فایل‌های داخل EPUB غیرعادی است.")
             total = 0
             for info in infos:
                 parts = info.filename.replace("\\", "/").split("/")
                 if info.filename.startswith(("/", "\\")) or ".." in parts:
-                    raise AnalyzerError(422, "مسیرهای نامعتبر داخل فایل EPUB وجود دارد.")
+                    raise AnalyzerError(422, "مسیرهای نامعتبر داخل فایل وجود دارد.")
                 if info.flag_bits & 0x1:
-                    raise AnalyzerError(422, "فایل رمزگذاری‌شده است و قابل پردازش نیست.")
+                    raise AnalyzerError(422, "فایل رمزگذاری‌شده است.")
                 if info.file_size > MAX_ENTRY_SIZE:
-                    raise AnalyzerError(422, "حجم یکی از فایل‌های داخل EPUB بیش از حد مجاز است.")
+                    raise AnalyzerError(422, "حجم یکی از فایل‌های داخلی بیش از حد مجاز است.")
                 if info.file_size > (1 << 20) and info.compress_size and \
                         info.file_size / info.compress_size > MAX_COMPRESSION_RATIO:
-                    raise AnalyzerError(422, "فایل مشکوک به ZIP Bomb است و پردازش نمی‌شود.")
+                    raise AnalyzerError(422, "فایل مشکوک به ZIP Bomb است.")
                 total += info.file_size
             if total > MAX_UNCOMPRESSED_SIZE:
                 raise AnalyzerError(422, "حجم محتوای EPUB پس از باز شدن بیش از حد مجاز است.")
             names = {i.filename for i in infos}
             if "META-INF/container.xml" not in names:
-                raise AnalyzerError(422, "ساختار EPUB نامعتبر است (فایل container.xml یافت نشد).")
+                raise AnalyzerError(422, "ساختار EPUB نامعتبر است (container.xml یافت نشد).")
             if "mimetype" in names and zf.open("mimetype").read(64).strip() != b"application/epub+zip":
-                raise AnalyzerError(422, "نوع MIME فایل با EPUB مطابقت ندارد.")
+                raise AnalyzerError(422, "نوع MIME با EPUB مطابقت ندارد.")
             if "META-INF/encryption.xml" in names:
                 algos = re.findall(r'Algorithm="([^"]+)"', zf.read("META-INF/encryption.xml").decode("utf-8", "ignore"))
                 if any(a not in _FONT_OBFUSCATION for a in algos):
-                    raise AnalyzerError(422, "این کتاب با DRM محافظت شده و قابل پردازش نیست.")
+                    raise AnalyzerError(422, "این کتاب با DRM محافظت شده است.")
     except AnalyzerError:
         raise
     except (zipfile.BadZipFile, NotImplementedError, RuntimeError, EOFError, OSError, ValueError):
         raise AnalyzerError(422, "فایل EPUB خراب است یا قابل خواندن نیست.")
 
 
-# ========================= 9. EPUB Extraction ===========================
-BLOCK_TAGS = {"p", "div", "li", "ul", "ol", "blockquote", "section", "article", "aside", "tr", "td", "th", "table",
-              "dd", "dt", "dl", "figcaption", "figure", "pre", "header", "footer", "main", "body", "caption", "hr",
-              "h1", "h2", "h3", "h4", "h5", "h6"}
-HEADING_TAGS = {"h1", "h2", "h3", "h4", "h5", "h6"}
-SKIP_TAGS = {"script", "style", "svg", "math", "img", "head", "nav", "audio", "video", "canvas", "object", "iframe"}
-NAV_TYPES = {"toc", "landmarks", "page-list"}
-NON_CHAPTER_TYPES = {"toc", "landmarks", "cover", "titlepage", "halftitlepage", "copyright-page"}
-
-
-def _types(tag: Tag) -> set[str]:
-    raw = f"{tag.get('epub:type') or ''} {tag.get('role') or ''}"
-    return {t.removeprefix("doc-") for t in raw.split()}
-
-
-def _flush(out: list, buf: list, heading: bool) -> None:
-    if buf:
-        text = normalize_text("".join(buf))
-        buf.clear()
-        if WORD_RE.search(text):
-            out.append((text, heading))
-
-
-def _walk(node, out: list, buf: list, heading: bool) -> None:
-    for child in node.children:
-        if isinstance(child, NavigableString):
-            if not isinstance(child, PreformattedString):  # کامنت، CDATA، Doctype حذف می‌شوند
-                buf.append(str(child))
-        elif isinstance(child, Tag):
-            name = (child.name or "").lower()
-            if name in SKIP_TAGS or _types(child) & NAV_TYPES:
-                continue
-            if name == "br":
-                buf.append(" ")
-            elif name in BLOCK_TAGS:
-                inner = heading or name in HEADING_TAGS
-                _flush(out, buf, heading)
-                _walk(child, out, buf, inner)
-                _flush(out, buf, inner)
-            else:
-                _walk(child, out, buf, heading)
-
-
-def extract_blocks(soup: BeautifulSoup) -> list[tuple[str, bool]]:
-    """بلوک‌های متنی سند را به‌صورت (متن، آیا_عنوان_است) و به ترتیب خوانش برمی‌گرداند."""
-    out: list[tuple[str, bool]] = []
-    buf: list[str] = []
-    _walk(soup, out, buf, False)
-    _flush(out, buf, False)
-    return out
-
-
-def is_non_chapter_doc(soup: BeautifulSoup, blocks: list[tuple[str, bool]]) -> bool:
-    """Navigation، فهرست مطالب، جلد و صفحات مشابه را تشخیص می‌دهد."""
-    body = soup.body or soup
-    kinds = _types(body) if isinstance(body, Tag) else set()
-    children = [c for c in body.children if isinstance(c, Tag)]
-    if len(children) == 1:
-        kinds |= _types(children[0])
-    if kinds & NON_CHAPTER_TYPES:
-        return True
-    links = soup.find_all("a")
-    total = sum(len(t) for t, _ in blocks)
-    link_chars = sum(len(normalize_text(a.get_text())) for a in links)
-    return len(links) >= 5 and total > 0 and link_chars / total > 0.7
-
-
-# ========================= 10. Text Normalization =======================
+# ========================= 9. Text Utilities ============================
 _STRIP = dict.fromkeys(map(ord, "\u00ad\u200b\u200d\u200e\u200f\u202a\u202b\u202c\u202d\u202e"
                                 "\u2066\u2067\u2068\u2069\ufeff\u0640"))
 
 
 def normalize_text(text: str) -> str:
-    """NFKC، حذف نویسه‌های نامرئی (به‌جز نیم‌فاصله ZWNJ) و کشیده، و فشرده‌سازی فاصله‌ها."""
     text = unicodedata.normalize("NFKC", text).translate(_STRIP)
     return re.sub(r"\s+", " ", text).strip()
 
 
-# ============================ 11. Word Counting =========================
-# کلمه = دنباله‌ای از حروف/ارقام یونیکد (به‌همراه اعراب)، که با نیم‌فاصله (ZWNJ)، آپوستروف یا خط‌تیره
-# به هم می‌پیوندند ("کتاب‌خوانی"، "well-known"، "don't")؛ همچنین اعداد اعشاری/هزارگان ("3.14"، "۱٬۲۰۰").
 _MARKS = "\u0300-\u036f\u0610-\u061a\u064b-\u065f\u0670\u06d6-\u06ed"
 _W = rf"(?:[^\W_]|[{_MARKS}])"
 WORD_RE = re.compile(rf"\d+(?:[.,٫٬]\d+)+(?![^\W_])|{_W}+(?:[\u200c'’\-\u2010]{_W}+)*")
@@ -554,9 +662,7 @@ def count_words(text: str) -> int:
     return sum(1 for _ in WORD_RE.finditer(text))
 
 
-# ========================= 12. Character Counting =======================
 def count_characters(text: str) -> dict[str, int]:
-    """متن باید از قبل نرمال شده باشد (تنها فاصله باقی‌مانده، space معمولی است)."""
     letters = sum(map(str.isalpha, text))
     spaces = text.count(" ")
     punct = sum(1 for ch in text if not ch.isalnum() and unicodedata.category(ch)[0] in "PS")
@@ -565,14 +671,12 @@ def count_characters(text: str) -> dict[str, int]:
             "characters_clean": len(text) - spaces - punct}
 
 
-# ========================== 13. Sentence Counting =======================
 _SENT_END = re.compile(r"([.!?؟۔…]+)[\"'”’»)\]]*(?=\s|$)")
 _ABBREV = {"mr", "mrs", "ms", "dr", "prof", "sr", "jr", "st", "vs"}
 _LAST_WORD = re.compile(r"([^\W\d_]+)$")
 
 
 def count_sentences(text: str) -> int:
-    """هر گروه علائم پایان‌جمله (مثل ?! یا ...) یک مرز است؛ مخفف‌ها (Dr.) و حروف اول (J.) مرز نیستند."""
     count, start = 0, 0
     for m in _SENT_END.finditer(text):
         seg = text[start:m.start()]
@@ -588,13 +692,180 @@ def count_sentences(text: str) -> int:
     return count + (1 if WORD_RE.search(text[start:]) else 0)
 
 
-# ========================= 14. Paragraph Counting =======================
+# ========================= 10. Language Detection ======================
+_PERSIAN_SPECIFIC = set("پچژگکیۀ")
+_ARABIC_RANGE = [(0x0600, 0x06FF), (0x0750, 0x077F), (0xFB50, 0xFDFF), (0xFE70, 0xFEFF)]
+
+
+def _in_ranges(ch: str, ranges) -> bool:
+    cp = ord(ch)
+    return any(lo <= cp <= hi for lo, hi in ranges)
+
+
+def detect_language(text: str) -> str:
+    counts = {"fa": 0, "ar": 0, "en": 0, "ru": 0, "zh": 0}
+    sample = text[:20000]
+    for ch in sample:
+        if _in_ranges(ch, _ARABIC_RANGE):
+            if ch in _PERSIAN_SPECIFIC:
+                counts["fa"] += 1
+            else:
+                counts["ar"] += 1
+        elif "a" <= ch.lower() <= "z":
+            counts["en"] += 1
+        elif 0x0400 <= ord(ch) <= 0x04FF:
+            counts["ru"] += 1
+        elif 0x4E00 <= ord(ch) <= 0x9FFF:
+            counts["zh"] += 1
+    total_arabic = counts["fa"] + counts["ar"]
+    if total_arabic > 0 and counts["fa"] / total_arabic > 0.01:
+        counts["fa"] += counts["ar"]
+        counts["ar"] = 0
+    if not any(counts.values()):
+        return "unknown"
+    return max(counts, key=counts.get)
+
+
+# ======================== 11. Block Extraction =========================
+BLOCK_TAGS = {"p", "div", "li", "ul", "ol", "blockquote", "section", "article", "aside", "tr", "td", "th", "table",
+              "dd", "dt", "dl", "figcaption", "figure", "pre", "header", "footer", "main", "body", "caption", "hr",
+              "h1", "h2", "h3", "h4", "h5", "h6"}
+HEADING_TAGS = {"h1", "h2", "h3", "h4", "h5", "h6"}
+HEADING_LEVELS = {"h1": 1, "h2": 2, "h3": 3, "h4": 4, "h5": 5, "h6": 6}
+SKIP_TAGS = {"script", "style", "svg", "math", "img", "head", "nav", "audio", "video", "canvas", "object", "iframe"}
+NAV_TYPES = {"toc", "landmarks", "page-list"}
+NON_CHAPTER_TYPES = {"toc", "landmarks", "cover", "titlepage", "halftitlepage", "copyright-page"}
+
+
+def _types(tag: Tag) -> set[str]:
+    raw = f"{tag.get('epub:type') or ''} {tag.get('role') or ''}"
+    return {t.removeprefix("doc-") for t in raw.split()}
+
+
+def _emit_text(buf, out, in_heading):
+    if buf:
+        text = normalize_text("".join(buf))
+        buf.clear()
+        if WORD_RE.search(text):
+            out.append((text, in_heading))
+
+
+def extract_blocks(soup: BeautifulSoup) -> list[tuple[str, bool]]:
+    out: list[tuple[str, bool]] = []
+    buf: list[str] = []
+
+    def walk(node, in_heading):
+        for child in node.children:
+            if isinstance(child, NavigableString):
+                if not isinstance(child, PreformattedString):
+                    buf.append(str(child))
+            elif isinstance(child, Tag):
+                name = (child.name or "").lower()
+                if name in SKIP_TAGS or _types(child) & NAV_TYPES:
+                    continue
+                if name == "br":
+                    buf.append(" ")
+                elif name in BLOCK_TAGS:
+                    inner = in_heading or name in HEADING_TAGS
+                    _emit_text(buf, out, in_heading)
+                    walk(child, inner)
+                    _emit_text(buf, out, inner)
+                else:
+                    walk(child, in_heading)
+
+    walk(soup, False)
+    _emit_text(buf, out, False)
+    return out
+
+
+def extract_blocks_marked(soup: BeautifulSoup, fragment_titles: dict[str, str] | None = None,
+                          split_level: int | None = None) -> list[tuple[str, bool, str | None]]:
+    out: list[tuple[str, bool, str | None]] = []
+    buf: list[str] = []
+    pending = [None]
+
+    def flush(in_heading):
+        if buf:
+            text = normalize_text("".join(buf))
+            buf.clear()
+            if WORD_RE.search(text):
+                marker = pending[0]
+                pending[0] = None
+                out.append((text, in_heading, marker))
+
+    def walk(node, in_heading):
+        for child in node.children:
+            if isinstance(child, NavigableString):
+                if not isinstance(child, PreformattedString):
+                    buf.append(str(child))
+            elif isinstance(child, Tag):
+                name = (child.name or "").lower()
+                if name in SKIP_TAGS or _types(child) & NAV_TYPES:
+                    continue
+                marker = None
+                cid = child.get("id")
+                if fragment_titles and cid and cid in fragment_titles:
+                    marker = fragment_titles[cid]
+                elif split_level is not None and name in HEADING_TAGS:
+                    if HEADING_LEVELS.get(name, 99) <= split_level:
+                        txt = normalize_text(child.get_text())
+                        marker = (txt[:120] or None) if txt else None
+                if marker is not None and not in_heading:
+                    flush(in_heading)
+                    pending[0] = marker
+                if name == "br":
+                    buf.append(" ")
+                elif name in BLOCK_TAGS:
+                    inner = in_heading or name in HEADING_TAGS
+                    flush(in_heading)
+                    walk(child, inner)
+                    flush(inner)
+                else:
+                    walk(child, in_heading)
+
+    walk(soup, False)
+    flush(False)
+    return out
+
+
+def group_by_markers(marked: list[tuple[str, bool, str | None]]) -> list[dict]:
+    groups: list[dict] = []
+    current: dict = {"title": None, "blocks": []}
+    for text, heading, marker in marked:
+        if marker is not None and (current["blocks"] or current["title"]):
+            groups.append(current)
+            current = {"title": marker, "blocks": []}
+        elif marker is not None:
+            current["title"] = marker
+        current["blocks"].append((text, heading))
+    if current["blocks"] or current["title"]:
+        groups.append(current)
+    while len(groups) > 1 and groups[0]["blocks"] and all(h for _, h in groups[0]["blocks"]):
+        groups[1]["blocks"] = groups[0]["blocks"] + groups[1]["blocks"]
+        groups = groups[1:]
+    return groups
+
+
+def is_non_chapter_doc(soup: BeautifulSoup, blocks: list[tuple[str, bool]]) -> bool:
+    body = soup.body or soup
+    kinds = _types(body) if isinstance(body, Tag) else set()
+    children = [c for c in body.children if isinstance(c, Tag)]
+    if len(children) == 1:
+        kinds |= _types(children[0])
+    if kinds & NON_CHAPTER_TYPES:
+        return True
+    links = soup.find_all("a")
+    total = sum(len(t) for t, _ in blocks)
+    link_chars = sum(len(normalize_text(a.get_text())) for a in links)
+    return len(links) >= 5 and total > 0 and link_chars / total > 0.7
+
+
+# ========================== 12. Text Metrics ===========================
 STAT_KEYS = ("words", "letters", "spaces", "characters", "characters_without_spaces", "characters_clean",
              "paragraphs", "sentences", "paragraph_words")
 
 
 def analyze_blocks(blocks: list[tuple[str, bool]]) -> dict[str, int]:
-    """عنوان‌ها در کلمه/حرف/کاراکتر لحاظ می‌شوند ولی پاراگراف و جمله به‌حساب نمی‌آیند."""
     stats = dict.fromkeys(STAT_KEYS, 0)
     for text, heading in blocks:
         words = count_words(text)
@@ -609,13 +880,22 @@ def analyze_blocks(blocks: list[tuple[str, bool]]) -> dict[str, int]:
     return stats
 
 
-# =========================== 15. Chapter Analysis =======================
+# =========================== 13. Chapter Analysis =======================
 def _norm_href(href: str | None) -> str:
-    return posixpath.normpath(unquote((href or "").split("#")[0])).lstrip("./") if href else ""
+    if not href:
+        return ""
+    path = unquote(href.split("#")[0])
+    return posixpath.normpath(path) if path else ""
+
+
+def _parse_href(href: str | None) -> tuple[str, str]:
+    if not href:
+        return "", ""
+    path, _, frag = href.partition("#")
+    return _norm_href(path), unquote(frag)
 
 
 def toc_leaves(items) -> list[tuple[str, str]]:
-    """برگ‌های فهرست مطالب (عنوان، مسیر) به ترتیب."""
     result = []
     for it in items:
         if isinstance(it, (tuple, list)) and len(it) == 2 and isinstance(it[1], (list, tuple)):
@@ -629,9 +909,49 @@ def toc_leaves(items) -> list[tuple[str, str]]:
     return result
 
 
-def analyze_chapters(book: epub.EpubBook) -> tuple[list[dict], dict[str, int], str]:
-    """سندهای Spine را به ترتیب پردازش و به فصل تبدیل می‌کند. خروجی: (فصل‌ها، جمع کل، منبع فصل‌بندی)."""
-    docs, seen = [], set()
+def _find_doc(docs: list[dict], path: str) -> dict | None:
+    if not path:
+        return None
+    by_path = {d["name"]: d for d in docs}
+    doc = by_path.get(path)
+    if doc is not None:
+        return doc
+    for p, d in by_path.items():
+        if p.endswith("/" + path):
+            return d
+    base = posixpath.basename(path)
+    matches = [d for d in docs if posixpath.basename(d["name"]) == base]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _get_doc_sections(doc: dict, toc_entries: list[tuple[str, str | None]]) -> list[dict]:
+    with_frag = [(ttl, frag) for ttl, frag in toc_entries if frag]
+    without_frag = [ttl for ttl, frag in toc_entries if not frag]
+
+    if len(with_frag) >= 1:
+        frag_titles = {frag: ttl for ttl, frag in with_frag}
+        marked = extract_blocks_marked(doc["soup"], fragment_titles=frag_titles)
+        sections = group_by_markers(marked)
+        if sections and sections[0]["title"] is None and without_frag:
+            sections[0]["title"] = without_frag[0]
+        return sections
+
+    if without_frag:
+        return [{"title": without_frag[0], "blocks": extract_blocks(doc["soup"])}]
+
+    for level in (1, 2, 3):
+        marked = extract_blocks_marked(doc["soup"], split_level=level)
+        sections = group_by_markers(marked)
+        if len(sections) > 1:
+            return sections
+        if len(sections) == 1 and sections[0]["title"]:
+            return sections
+    return [{"title": None, "blocks": extract_blocks(doc["soup"])}]
+
+
+def analyze_chapters(book: epub.EpubBook) -> tuple[list[dict], str]:
+    docs: list[dict] = []
+    seen = set()
     for entry in book.spine:
         idref = entry[0] if isinstance(entry, (tuple, list)) else entry
         item = book.get_item_with_id(idref)
@@ -645,55 +965,52 @@ def analyze_chapters(book: epub.EpubBook) -> tuple[list[dict], dict[str, int], s
         if not blocks or is_non_chapter_doc(soup, blocks):
             continue
         digest = hashlib.sha1("\n".join(t for t, _ in blocks).encode("utf-8")).hexdigest()
-        if digest in seen:  # سند تکراری
+        if digest in seen:
             continue
         seen.add(digest)
-        heading = next((t for t, h in blocks if h and len(t) <= 150), None)
-        docs.append({"name": _norm_href(item.get_name()), "heading": heading, "stats": analyze_blocks(blocks)})
+        docs.append({"name": _norm_href(item.get_name()), "soup": soup, "blocks": blocks})
+
     if not docs:
-        raise AnalyzerError(422, "در این EPUB محتوای متنی قابل‌خواندن پیدا نشد.")
+        raise AnalyzerError(422, "در این فایل محتوای متنی قابل‌خواندن پیدا نشد.")
 
-    by_path = {d["name"]: d for d in docs}
-    by_base: dict[str, list] = {}
-    for d in docs:
-        by_base.setdefault(posixpath.basename(d["name"]), []).append(d)
-    starts: dict[int, str] = {}  # شناسه سند -> عنوان فصل در TOC
+    toc_map: dict[int, list[tuple[str, str | None]]] = {}
     for title, href in toc_leaves(book.toc or []):
-        path = _norm_href(href)
-        doc = by_path.get(path) or next((x for p, x in by_path.items() if p.endswith("/" + path)), None)
-        if doc is None and len(by_base.get(posixpath.basename(path), [])) == 1:
-            doc = by_base[posixpath.basename(path)][0]
-        if doc is not None and id(doc) not in starts:
-            starts[id(doc)] = title
+        path, frag = _parse_href(href)
+        doc = _find_doc(docs, path)
+        if doc is not None:
+            toc_map.setdefault(id(doc), []).append((title, frag or None))
 
-    groups: list[dict] = []
-    source = "toc" if starts else "spine"
-    pending: list[dict] = []
-    for d in docs:
-        if source == "spine" or id(d) in starts:
-            title = starts.get(id(d)) or d["heading"] or f"بخش {len(groups) + 1}"
-            groups.append({"title": title, "parts": pending + [d]})
-            pending = []
-        elif groups:
-            groups[-1]["parts"].append(d)
-        else:
-            pending.append(d)  # متن قبل از اولین فصل TOC به فصل اول می‌پیوندد
+    chapters: list[dict] = []
+    for doc in docs:
+        toc_entries = toc_map.get(id(doc), [])
+        sections = _get_doc_sections(doc, toc_entries)
+        for sec in sections:
+            if not sec["blocks"]:
+                continue
+            if sec["title"] is None:
+                if chapters:
+                    chapters[-1]["blocks"].extend(sec["blocks"])
+                else:
+                    chapters.append({"title": None, "blocks": sec["blocks"]})
+            else:
+                chapters.append({"title": sec["title"], "blocks": sec["blocks"]})
 
-    total = dict.fromkeys(STAT_KEYS, 0)
-    chapters = []
-    for i, g in enumerate(groups, 1):
-        agg = dict.fromkeys(STAT_KEYS, 0)
-        for part in g["parts"]:
-            for k in STAT_KEYS:
-                agg[k] += part["stats"][k]
-        for k in STAT_KEYS:
-            total[k] += agg[k]
-        chapters.append({"index": i, "title": g["title"], "words": agg["words"], "letters": agg["letters"],
-                         "paragraphs": agg["paragraphs"], "sentences": agg["sentences"]})
-    return chapters, total, source
+    if not chapters:
+        raise AnalyzerError(422, "فصلی در این کتاب پیدا نشد.")
+    for i, ch in enumerate(chapters, 1):
+        if not ch["title"]:
+            ch["title"] = f"بخش {i}"
+
+    if toc_map:
+        source = "toc"
+    elif any(len(_get_doc_sections(d, [])) > 1 for d in docs):
+        source = "headings"
+    else:
+        source = "spine"
+    return chapters, source
 
 
-# ========================= 16. Metadata Extraction ======================
+# ========================= 14. Metadata & Cover ========================
 def extract_metadata(book: epub.EpubBook) -> dict:
     def values(name: str) -> list[str]:
         try:
@@ -712,17 +1029,297 @@ def extract_metadata(book: epub.EpubBook) -> dict:
             "publication_date": first("date"), "description": description or None}
 
 
-# ============================= 17. API Routes ===========================
-def analyze_epub(data: bytes, words_per_minute: int, words_per_page: int) -> dict:
-    """تحلیل کامل در حافظه (همگام؛ از طریق thread اجرا می‌شود)."""
+def extract_cover(book: epub.EpubBook) -> str | None:
+    """تشخیص جلد با سه روش fallback: OPF meta، properties، و نام فایل."""
+
+    def _to_data_url(item) -> str | None:
+        try:
+            content = getattr(item, "content", None)
+            if content is None and hasattr(item, "get_content"):
+                try:
+                    content = item.get_content()
+                except Exception:
+                    content = None
+            if not content or not isinstance(content, (bytes, bytearray)):
+                return None
+            if len(content) > MAX_COVER_BYTES:
+                return None
+            mime = None
+            for attr in ("media_type", "content_type", "mediaType"):
+                mime = getattr(item, attr, None)
+                if mime:
+                    break
+            if not mime:
+                name = (getattr(item, "file_name", "") or "").lower()
+                if name.endswith(".png"): mime = "image/png"
+                elif name.endswith(".gif"): mime = "image/gif"
+                elif name.endswith(".webp"): mime = "image/webp"
+                elif name.endswith(".svg"): mime = "image/svg+xml"
+                else: mime = "image/jpeg"
+            if not isinstance(mime, str) or not mime.startswith("image/"):
+                return None
+            return f"data:{mime};base64,{base64.b64encode(bytes(content)).decode('ascii')}"
+        except Exception:
+            return None
+
+    # روش ۱: OPF meta name="cover" content="<id>"
+    try:
+        meta = book.get_metadata("OPF", "cover")
+        for entry in meta or []:
+            cover_id = None
+            if isinstance(entry, tuple) and len(entry) == 2:
+                val, attrs = entry
+                if isinstance(attrs, dict):
+                    cover_id = attrs.get("content") or attrs.get("name")
+                if not cover_id and isinstance(val, str):
+                    cover_id = val
+            elif isinstance(entry, str):
+                cover_id = entry
+            if cover_id:
+                item = book.get_item_with_id(cover_id)
+                if item is not None:
+                    url = _to_data_url(item)
+                    if url:
+                        return url
+    except Exception:
+        pass
+
+    # روش ۲: item با properties شامل "cover-image"
+    try:
+        for item in book.get_items():
+            props = getattr(item, "properties", None) or []
+            if isinstance(props, (list, tuple)) and "cover-image" in props:
+                url = _to_data_url(item)
+                if url:
+                    return url
+    except Exception:
+        pass
+
+    # روش ۳: تصویری که در نام فایلش "cover" هست
+    try:
+        for item in book.get_items():
+            try:
+                item_type = item.get_type() if hasattr(item, "get_type") else None
+            except Exception:
+                item_type = None
+            if item_type != 1:  # ITEM_IMAGE
+                continue
+            name = (getattr(item, "file_name", "") or "").lower()
+            if "cover" in name:
+                url = _to_data_url(item)
+                if url:
+                    return url
+    except Exception:
+        pass
+
+    return None
+
+
+# ======================== 15. Format Analyzers =========================
+def _decode_text(data: bytes) -> str:
+    for enc in ("utf-8", "utf-8-sig", "windows-1256", "cp1252", "latin-1"):
+        try:
+            return data.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return data.decode("utf-8", errors="replace")
+
+
+def _txt_to_blocks(text: str) -> list[tuple[str, bool]]:
+    blocks = []
+    for para in re.split(r"\n\s*\n", text):
+        norm = normalize_text(para)
+        if WORD_RE.search(norm):
+            blocks.append((norm, False))
+    if not blocks:
+        norm = normalize_text(text)
+        if WORD_RE.search(norm):
+            blocks.append((norm, False))
+    return blocks
+
+
+def analyze_txt(data: bytes, filename: str, wpm: int, wpp: int) -> dict:
+    blocks = _txt_to_blocks(_decode_text(data))
+    if not blocks:
+        raise AnalyzerError(422, "متنی در فایل TXT پیدا نشد.")
+    title = _filename_to_title(filename)
+    return _build_response(
+        meta={"title": title, "author": None, "publisher": None, "language": None,
+              "identifier": None, "publication_date": None, "description": None},
+        chapters_data=[{"title": title, "blocks": blocks}],
+        source="single", cover=None, wpm=wpm, wpp=wpp)
+
+
+def analyze_docx(data: bytes, filename: str, wpm: int, wpp: int) -> dict:
+    if not _HAS_DOCX:
+        raise AnalyzerError(501, "پشتیبانی DOCX روی سرور نصب نیست (python-docx).")
+    try:
+        doc = DocxDocument(io.BytesIO(data))
+    except Exception:
+        raise AnalyzerError(422, "فایل DOCX نامعتبر است.")
+
+    chapters: list[dict] = []
+    current = {"title": None, "blocks": []}
+    for para in doc.paragraphs:
+        text = normalize_text(para.text or "")
+        if not text or not WORD_RE.search(text):
+            continue
+        style = ""
+        try:
+            style = (para.style.name or "").lower() if para.style else ""
+        except Exception:
+            style = ""
+        is_heading = style.startswith("heading") or style == "title"
+        if is_heading:
+            if current["blocks"]:
+                chapters.append(current)
+                current = {"title": text, "blocks": [(text, True)]}
+            else:
+                current["title"] = current["title"] or text
+                current["blocks"].append((text, True))
+        else:
+            current["blocks"].append((text, False))
+    if current["blocks"]:
+        chapters.append(current)
+    if not chapters:
+        raise AnalyzerError(422, "متنی در DOCX پیدا نشد.")
+
+    title = _filename_to_title(filename)
+    if len(chapters) == 1 and not chapters[0]["title"]:
+        chapters[0]["title"] = title
+    return _build_response(
+        meta={"title": title, "author": None, "publisher": None, "language": None,
+              "identifier": None, "publication_date": None, "description": None},
+        chapters_data=chapters,
+        source="headings" if len(chapters) > 1 else "single",
+        cover=None, wpm=wpm, wpp=wpp)
+
+
+def analyze_pdf(data: bytes, filename: str, wpm: int, wpp: int) -> dict:
+    if not _HAS_PDF:
+        raise AnalyzerError(501, "پشتیبانی PDF روی سرور نصب نیست (pypdf).")
+    try:
+        reader = PdfReader(io.BytesIO(data))
+    except Exception:
+        raise AnalyzerError(422, "فایل PDF نامعتبر است.")
+    try:
+        if reader.is_encrypted:
+            try:
+                if not reader.decrypt(""):
+                    raise AnalyzerError(422, "PDF رمزگذاری‌شده قابل پردازش نیست.")
+            except AnalyzerError:
+                raise
+            except Exception:
+                raise AnalyzerError(422, "PDF رمزگذاری‌شده قابل پردازش نیست.")
+    except AnalyzerError:
+        raise
+    except Exception:
+        pass
+
+    if len(reader.pages) > MAX_PDF_PAGES:
+        raise AnalyzerError(422, f"تعداد صفحات PDF بیش از {MAX_PDF_PAGES} است.")
+
+    blocks: list[tuple[str, bool]] = []
+    for page in reader.pages:
+        try:
+            text = page.extract_text() or ""
+        except Exception:
+            continue
+        for para in re.split(r"\n\s*\n", text):
+            norm = normalize_text(para)
+            if WORD_RE.search(norm):
+                blocks.append((norm, False))
+
+    if not blocks:
+        raise AnalyzerError(422, "متنی در PDF پیدا نشد (شاید اسکن‌شده یا تصویری باشد).")
+
+    title = _filename_to_title(filename)
+    return _build_response(
+        meta={"title": title, "author": None, "publisher": None, "language": None,
+              "identifier": None, "publication_date": None, "description": None},
+        chapters_data=[{"title": title, "blocks": blocks}],
+        source="single", cover=None, wpm=wpm, wpp=wpp)
+
+
+def analyze_fb2(data: bytes, filename: str, wpm: int, wpp: int) -> dict:
+    head = data[:200].decode("ascii", errors="ignore")
+    m = re.search(r'encoding=["\']([^"\']+)', head)
+    enc = m.group(1) if m else "utf-8"
+    try:
+        text = data.decode(enc)
+    except (LookupError, UnicodeDecodeError):
+        text = data.decode("utf-8", errors="replace")
+    try:
+        soup = BeautifulSoup(text, _XML_PARSER)
+    except Exception:
+        raise AnalyzerError(422, "فایل FB2 نامعتبر است.")
+
+    meta = {"title": None, "author": None, "publisher": None, "language": None,
+            "identifier": None, "publication_date": None, "description": None}
+    ti = soup.find("title-info")
+    if ti:
+        bt = ti.find("book-title")
+        if bt:
+            meta["title"] = clean_str(bt.get_text())
+        authors = []
+        for a in ti.find_all("author"):
+            fn = a.find("first-name")
+            ln = a.find("last-name")
+            full = " ".join(x for x in [(fn.get_text() if fn else ""), (ln.get_text() if ln else "")] if x).strip()
+            if full:
+                authors.append(full)
+        if authors:
+            meta["author"] = ", ".join(authors)
+        lang = ti.find("lang")
+        if lang:
+            meta["language"] = clean_str(lang.get_text())
+        ann = ti.find("annotation")
+        if ann:
+            meta["description"] = clean_str(ann.get_text(" "))
+    if not meta["title"]:
+        meta["title"] = _filename_to_title(filename)
+
+    body = soup.find("body")
+    if body is None:
+        raise AnalyzerError(422, "بدنه FB2 پیدا نشد.")
+
+    chapters: list[dict] = []
+    for section in body.find_all("section", recursive=False):
+        title_el = section.find("title", recursive=False)
+        title = clean_str(title_el.get_text(" ")) if title_el else None
+        blocks: list[tuple[str, bool]] = []
+        for p in section.find_all("p"):
+            norm = normalize_text(p.get_text(" "))
+            if WORD_RE.search(norm):
+                blocks.append((norm, False))
+        if blocks:
+            chapters.append({"title": title, "blocks": blocks})
+
+    if not chapters:
+        blocks: list[tuple[str, bool]] = []
+        for p in body.find_all("p"):
+            norm = normalize_text(p.get_text(" "))
+            if WORD_RE.search(norm):
+                blocks.append((norm, False))
+        if not blocks:
+            raise AnalyzerError(422, "متنی در FB2 پیدا نشد.")
+        chapters.append({"title": meta["title"], "blocks": blocks})
+
+    return _build_response(meta=meta, chapters_data=chapters,
+                           source="headings" if len(chapters) > 1 else "single",
+                           cover=None, wpm=wpm, wpp=wpp)
+
+
+def analyze_epub(data: bytes, wpm: int, wpp: int) -> dict:
     validate_epub(data)
     try:
         book = epub.read_epub(io.BytesIO(data), {"ignore_ncx": False})
     except Exception:
         raise AnalyzerError(422, "ساختار EPUB نامعتبر است و خوانده نشد.")
     try:
-        chapters, t, source = analyze_chapters(book)
+        chapters, source = analyze_chapters(book)
         meta = extract_metadata(book)
+        cover = extract_cover(book)
     except AnalyzerError:
         raise
     except RecursionError:
@@ -730,38 +1327,76 @@ def analyze_epub(data: bytes, words_per_minute: int, words_per_page: int) -> dic
     except Exception:
         logger.exception("Text extraction failed")
         raise AnalyzerError(500, "استخراج متن از کتاب با خطا مواجه شد.")
+    return _build_response(meta=meta, chapters_data=chapters, source=source,
+                           cover=cover, wpm=wpm, wpp=wpp)
 
-    words, paragraphs, sentences = t["words"], t["paragraphs"], t["sentences"]
+
+def analyze_file(data: bytes, filename: str, wpm: int, wpp: int) -> dict:
+    ext = filename.lower().rsplit(".", 1)[-1] if "." in filename else ""
+    dispatch = {"epub": analyze_epub, "txt": analyze_txt, "docx": analyze_docx,
+                "pdf": analyze_pdf, "fb2": analyze_fb2}
+    fn = dispatch.get(ext)
+    if fn is None:
+        raise AnalyzerError(415, f"فرمت پشتیبانی نمی‌شود. فرمت‌های مجاز: {', '.join(sorted(SUPPORTED_FORMATS))}")
+    if ext == "epub":
+        return fn(data, wpm, wpp)
+    return fn(data, filename, wpm, wpp)
+
+
+# ========================== 16. Response Builder =======================
+def _build_response(meta: dict, chapters_data: list[dict], source: str,
+                    cover: str | None, wpm: int, wpp: int) -> dict:
+    total = dict.fromkeys(STAT_KEYS, 0)
+    chapters_out = []
+    all_text_parts: list[str] = []
+    for i, ch in enumerate(chapters_data, 1):
+        stats = analyze_blocks(ch["blocks"])
+        for k in STAT_KEYS:
+            total[k] += stats[k]
+        all_text_parts.extend(t for t, _ in ch["blocks"])
+        rt = round(stats["words"] / wpm, 1) if wpm else 0
+        chapters_out.append({
+            "index": i, "title": ch["title"] or f"بخش {i}",
+            "words": stats["words"], "letters": stats["letters"],
+            "paragraphs": stats["paragraphs"], "sentences": stats["sentences"],
+            "reading_time_minutes": rt,
+        })
+
+    words, paragraphs, sentences = total["words"], total["paragraphs"], total["sentences"]
     ratio = lambda a, b: round(a / b, 2) if b else 0  # noqa: E731
+
+    detected = detect_language(" ".join(all_text_parts))
+
     return {
         "success": True,
-        "book": meta,
+        "book": {**meta, "detected_language": detected},
+        "cover": cover,
         "chapter_source": source,
         "statistics": {
             "words": words,
-            "letters": t["letters"],
-            "letters_with_spaces": t["letters"] + t["spaces"],
-            "characters": t["characters"],
-            "characters_without_spaces": t["characters_without_spaces"],
-            "characters_without_spaces_and_punctuation": t["characters_clean"],
+            "letters": total["letters"],
+            "letters_with_spaces": total["letters"] + total["spaces"],
+            "characters": total["characters"],
+            "characters_without_spaces": total["characters_without_spaces"],
+            "characters_without_spaces_and_punctuation": total["characters_clean"],
             "paragraphs": paragraphs,
             "sentences": sentences,
-            "chapters": len(chapters),
-            "average_word_length": ratio(t["letters"], words),
-            "average_sentence_length": ratio(t["paragraph_words"], sentences),
-            "average_paragraph_words": ratio(t["paragraph_words"], paragraphs),
-            "reading_time_minutes": round(words / words_per_minute, 1),
-            "estimated_pages": math.ceil(words / words_per_page),
-            "words_per_minute": words_per_minute,
-            "words_per_page": words_per_page,
+            "chapters": len(chapters_out),
+            "average_word_length": ratio(total["letters"], words),
+            "average_sentence_length": ratio(total["paragraph_words"], sentences),
+            "average_paragraph_words": ratio(total["paragraph_words"], paragraphs),
+            "reading_time_minutes": round(words / wpm, 1),
+            "estimated_pages": math.ceil(words / wpp),
+            "words_per_minute": wpm,
+            "words_per_page": wpp,
         },
-        "chapters": chapters,
+        "chapters": chapters_out,
     }
 
 
+# ============================ 17. API Routes ===========================
 @app.middleware("http")
 async def limit_upload_size(request: Request, call_next):
-    """رد سریع درخواست‌های بزرگ بر اساس Content-Length، پیش از خواندن بدنه."""
     if request.method == "POST" and request.url.path == "/api/analyze":
         length = request.headers.get("content-length", "")
         if length.isdigit() and int(length) > MAX_UPLOAD_SIZE + (1 << 20):
@@ -771,7 +1406,7 @@ async def limit_upload_size(request: Request, call_next):
 
 @app.exception_handler(RequestValidationError)
 async def validation_handler(request: Request, exc: RequestValidationError):
-    return error_response(400, "درخواست نامعتبر است. فایل و تنظیمات را بررسی کنید.")
+    return error_response(400, "درخواست نامعتبر است.")
 
 
 @app.exception_handler(Exception)
@@ -787,18 +1422,19 @@ async def index() -> HTMLResponse:
 
 @app.get("/health")
 async def health() -> dict:
-    return {"status": "ok", "service": APP_NAME}
+    return {"status": "ok", "service": APP_NAME, "version": APP_VERSION}
 
 
 @app.post("/api/analyze")
 async def analyze(file: UploadFile | None = File(None),
                   words_per_minute: int = Form(DEFAULT_WORDS_PER_MINUTE),
                   words_per_page: int = Form(DEFAULT_WORDS_PER_PAGE)):
-    """فایل EPUB را دریافت و تحلیل می‌کند (فقط در حافظه؛ بدون ذخیره دائمی)."""
     if file is None or not (file.filename or "").strip():
         return error_response(400, "فایلی انتخاب نشده است.")
-    if not file.filename.lower().endswith(".epub"):  # نام فایل هرگز به‌عنوان مسیر استفاده نمی‌شود
-        return error_response(415, "فقط فایل‌های EPUB پذیرفته می‌شوند.")
+    fname = file.filename
+    ext = "." + fname.lower().rsplit(".", 1)[-1] if "." in fname else ""
+    if ext not in SUPPORTED_FORMATS:
+        return error_response(415, f"فرمت پشتیبانی نمی‌شود. مجاز: {', '.join(sorted(SUPPORTED_FORMATS))}")
     try:
         data = await file.read(MAX_UPLOAD_SIZE + 1)
     finally:
@@ -809,7 +1445,8 @@ async def analyze(file: UploadFile | None = File(None),
         return error_response(400, "فایل انتخاب‌شده خالی است.")
     try:
         result = await asyncio.to_thread(
-            analyze_epub, data, nonneg_int(words_per_minute, DEFAULT_WORDS_PER_MINUTE, 5000),
+            analyze_file, data, fname,
+            nonneg_int(words_per_minute, DEFAULT_WORDS_PER_MINUTE, 5000),
             nonneg_int(words_per_page, DEFAULT_WORDS_PER_PAGE, 10000))
     except AnalyzerError as exc:
         return error_response(exc.status, exc.message)
@@ -822,5 +1459,4 @@ async def analyze(file: UploadFile | None = File(None),
 # ========================= 18. Application Startup ======================
 if __name__ == "__main__":
     import uvicorn
-
     uvicorn.run(app, host="127.0.0.1", port=8000)

@@ -11,9 +11,9 @@ import time
 import uvicorn
 import webview
 
-import main  # همان main.py پروژه؛ بدون تغییر
+import main
 
-PREFERRED_PORT = 48731  # پورت ثابت تا LocalStorage (تم انتخاب‌شده) بین اجراها حفظ شود
+PREFERRED_PORT = 48731
 
 
 def pick_port() -> int:
@@ -29,13 +29,16 @@ def pick_port() -> int:
 
 if __name__ == "__main__":
     port = pick_port()
-    # log_config=None ضروری است: در حالت --windowed مقدار sys.stdout برابر None است و لاگ پیش‌فرض uvicorn کرش می‌کند
+    if port != PREFERRED_PORT:
+        # پورت ثابت اشغال است؛ LocalStorage قبلی (تم/زبان) از دست می‌رود.
+        print(f"[EPUB Analyzer] پورت {PREFERRED_PORT} اشغال است؛ از پورت {port} استفاده می‌شود.")
     server = uvicorn.Server(uvicorn.Config(main.app, host="127.0.0.1", port=port, log_config=None))
     threading.Thread(target=server.run, daemon=True).start()
     while not server.started:
         time.sleep(0.05)
 
-    webview.create_window("EPUB Analyzer", f"http://127.0.0.1:{port}", width=1180, height=860, min_size=(480, 600))
+    webview.create_window("EPUB Analyzer", f"http://127.0.0.1:{port}",
+                          width=1180, height=860, min_size=(480, 600))
     webview.start(private_mode=False,
                   storage_path=os.path.join(os.environ.get("APPDATA", "."), "EPUBAnalyzer"))
     server.should_exit = True
